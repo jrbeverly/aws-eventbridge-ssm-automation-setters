@@ -1,0 +1,331 @@
+{
+  "Comment": "Resolves account/region targets (S3 manifest or inline), starts a multi-account SSM Automation execution, polls it, and classifies the outcome.",
+  "StartAt": "ValidateInput",
+  "States": {
+    "ValidateInput": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.manifest",
+              "IsPresent": true
+            },
+            {
+              "Not": {
+                "Variable": "$.targets",
+                "IsPresent": true
+              }
+            }
+          ],
+          "Next": "LoadManifest"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.targets",
+              "IsPresent": true
+            },
+            {
+              "Not": {
+                "Variable": "$.manifest",
+                "IsPresent": true
+              }
+            }
+          ],
+          "Next": "ValidateTargets"
+        }
+      ],
+      "Default": "FailInvalidInput"
+    },
+    "FailInvalidInput": {
+      "Type": "Fail",
+      "Error": "InvalidInput",
+      "Cause": "Exactly one of 'manifest' (S3 object reference) or 'targets' (inline target array) must be present in the input payload."
+    },
+    "LoadManifest": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Parameters": {
+        "Bucket.$": "$.manifest.bucket",
+        "Key.$": "$.manifest.key"
+      },
+      "ResultPath": "$.s3Result",
+      "Next": "ParseManifest",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "S3.S3Exception"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "FailManifestUnavailable"
+        }
+      ]
+    },
+    "FailManifestUnavailable": {
+      "Type": "Fail",
+      "Error": "ManifestUnavailable",
+      "Cause": "The S3 manifest object could not be read."
+    },
+    "ParseManifest": {
+      "Type": "Pass",
+      "Parameters": {
+        "operation.$": "$.operation",
+        "parameters.$": "$.parameters",
+        "manifest.$": "States.StringToJson($.s3Result.Body)"
+      },
+      "Next": "ExtractTargets"
+    },
+    "ValidateTargets": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.targets",
+          "IsPresent": true,
+          "Next": "ValidateOperation"
+        }
+      ],
+      "Default": "FailEmptyTargets"
+    },
+    "FailEmptyTargets": {
+      "Type": "Fail",
+      "Error": "EmptyTargets",
+      "Cause": "The resolved target set contains no 'targets' array, or the array is empty."
+    },
+    "ValidateOperation": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.operation",
+          "StringEquals": "ssm-parameter-store-high-throughput",
+          "Next": "ResolveTargetLocations"
+        }
+      ],
+      "Default": "FailUnknownOperation"
+    },
+    "FailUnknownOperation": {
+      "Type": "Fail",
+      "Error": "UnknownOperation",
+      "Cause": "The requested operation is not recognized."
+    },
+    "ResolveTargetLocations": {
+      "Type": "Map",
+      "ItemsPath": "$.targets",
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "ToTargetLocation",
+        "States": {
+          "ToTargetLocation": {
+            "Type": "Pass",
+            "Parameters": {
+              "Accounts.$": "States.Array($.account_id)",
+              "Regions.$": "$.regions",
+              "ExecutionRoleName": "AutomationSettersTargetExecutionRole",
+              "TargetLocationMaxConcurrency": "10",
+              "TargetLocationMaxErrors": "10"
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.targetLocations",
+      "Next": "StartExecution"
+    },
+    "StartExecution": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:startAutomationExecution",
+      "Parameters": {
+        "DocumentName.$": "$.operation",
+        "TargetLocations.$": "$.targetLocations",
+        "Parameters": {
+          "AutomationAssumeRole": [
+            "arn:aws:iam::{{global:ACCOUNT_ID}}:role/AutomationSettersTargetExecutionRole"
+          ],
+          "Enabled.$": "States.Array($.parameters.Enabled)"
+        }
+      },
+      "ResultPath": "$.automationExecution",
+      "Next": "WaitForCompletion",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.SsmException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ]
+    },
+    "WaitForCompletion": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetExecutionStatus"
+    },
+    "GetExecutionStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getAutomationExecution",
+      "Parameters": {
+        "AutomationExecutionId.$": "$.automationExecution.AutomationExecutionId"
+      },
+      "ResultPath": "$.executionStatus",
+      "Next": "CheckComplete",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.SsmException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "FailExecutionUnobservable"
+        }
+      ]
+    },
+    "FailExecutionUnobservable": {
+      "Type": "Fail",
+      "Error": "ExecutionUnobservable",
+      "Cause": "Unable to describe the Automation execution after multiple retries."
+    },
+    "CheckComplete": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Or": [
+            {
+              "Variable": "$.executionStatus.AutomationExecution.AutomationExecutionStatus",
+              "StringEquals": "Pending"
+            },
+            {
+              "Variable": "$.executionStatus.AutomationExecution.AutomationExecutionStatus",
+              "StringEquals": "InProgress"
+            },
+            {
+              "Variable": "$.executionStatus.AutomationExecution.AutomationExecutionStatus",
+              "StringEquals": "Waiting"
+            }
+          ],
+          "Next": "WaitForCompletion"
+        },
+        {
+          "Variable": "$.executionStatus.AutomationExecution.AutomationExecutionStatus",
+          "StringEquals": "Success",
+          "Next": "DescribeStepFailures"
+        }
+      ],
+      "Default": "DoneFailed"
+    },
+    "DescribeStepFailures": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:describeAutomationStepExecutions",
+      "Parameters": {
+        "AutomationExecutionId.$": "$.automationExecution.AutomationExecutionId",
+        "Filters": [
+          {
+            "Key": "StepExecutionStatus",
+            "Values": [
+              "Failed",
+              "TimedOut"
+            ]
+          }
+        ]
+      },
+      "ResultPath": "$.stepFailures",
+      "Next": "ClassifyOutcome",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.SsmException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "DoneFailed"
+        }
+      ]
+    },
+    "ClassifyOutcome": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.stepFailures.StepExecutions[0]",
+          "IsPresent": true,
+          "Next": "DoneCompletedWithFailures"
+        }
+      ],
+      "Default": "DoneSucceeded"
+    },
+    "DoneSucceeded": {
+      "Type": "Pass",
+      "Parameters": {
+        "outcome": "Succeeded",
+        "executionId.$": "$$.Execution.Id",
+        "operation.$": "$.operation",
+        "automationExecutionId.$": "$.automationExecution.AutomationExecutionId",
+        "targetCount.$": "States.ArrayLength($.targetLocations)"
+      },
+      "End": true
+    },
+    "DoneCompletedWithFailures": {
+      "Type": "Pass",
+      "Parameters": {
+        "outcome": "CompletedWithFailures",
+        "executionId.$": "$$.Execution.Id",
+        "operation.$": "$.operation",
+        "automationExecutionId.$": "$.automationExecution.AutomationExecutionId",
+        "targetCount.$": "States.ArrayLength($.targetLocations)",
+        "failedStepCount.$": "States.ArrayLength($.stepFailures.StepExecutions)"
+      },
+      "End": true
+    },
+    "DoneFailed": {
+      "Type": "Pass",
+      "Parameters": {
+        "outcome": "Failed",
+        "executionId.$": "$$.Execution.Id",
+        "operation.$": "$.operation",
+        "automationExecutionId.$": "$.automationExecution.AutomationExecutionId",
+        "automationStatus.$": "$.executionStatus.AutomationExecution.AutomationExecutionStatus",
+        "targetCount.$": "States.ArrayLength($.targetLocations)"
+      },
+      "End": true
+    },
+    "ExtractTargets": {
+      "Type": "Pass",
+      "Parameters": {
+        "operation.$": "$.operation",
+        "parameters.$": "$.parameters",
+        "targets.$": "$.manifest.targets"
+      },
+      "Next": "ValidateTargets"
+    }
+  }
+}

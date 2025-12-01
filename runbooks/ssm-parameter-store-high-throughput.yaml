@@ -1,0 +1,38 @@
+schemaVersion: '0.3'
+description: Sets the SSM Parameter Store high-throughput service setting and asserts the new value.
+assumeRole: '{{ AutomationAssumeRole }}'
+
+parameters:
+
+  AutomationAssumeRole:
+    type: String
+    description: Target-account execution role; the orchestrator passes arn:aws:iam::{{global:ACCOUNT_ID}}:role/AutomationSettersTargetExecutionRole.
+
+  Enabled:
+    type: String
+    allowedValues:
+      - 'true'
+      - 'false'
+    default: 'true'
+
+mainSteps:
+
+  - name: ApplySetting
+    action: aws:executeAwsApi
+    onFailure: Abort
+    inputs:
+      Service: ssm
+      Api: UpdateServiceSetting
+      SettingId: /ssm/parameter-store/high-throughput-enabled
+      SettingValue: '{{ Enabled }}'
+
+  - name: ValidateSetting
+    action: aws:assertAwsResourceProperty
+    onFailure: Abort
+    inputs:
+      Service: ssm
+      Api: GetServiceSetting
+      SettingId: /ssm/parameter-store/high-throughput-enabled
+      PropertySelector: $.ServiceSetting.SettingValue
+      DesiredValues:
+        - '{{ Enabled }}'
